@@ -19,12 +19,19 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_sp_world_size,
     get_tp_world_size,
 )
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_sequence_parallel_rank,
+    get_sequence_parallel_world_size,
+    get_sp_group,
+    get_sp_parallel_rank,
+)
 from sglang.multimodal_gen.runtime.layers.attention import (
     LoadBalancingUlyssesAttention,
     MinimalA2AAttnOp,
     UlyssesAttention_VSA,
     USPAttention,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.svg2_cost_profiler import _cuda_timed
 from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     FP32LayerNorm,
@@ -104,6 +111,7 @@ def _load_wan_profile_cfg() -> None:
     if _WAN_PROFILE_CFG_LOADED:
         return
     _WAN_PROFILE_CFG_LOADED = True
+    enable_profile = os.getenv("ENABLE_PROFILE", "0") not in ("0", "false")
     ts_spec = os.getenv("SGLANG_WAN_PROFILE_TIMESTEPS", "")
     layer_spec = os.getenv("SGLANG_WAN_PROFILE_LAYERS", "")
     _WAN_PROFILE_TIMESTEPS = _parse_int_spec(ts_spec)
@@ -122,7 +130,7 @@ def _load_wan_profile_cfg() -> None:
         _WAN_FORCE_PROFILE_LAYER = int(layer_spec)
     except ValueError:
         _WAN_FORCE_PROFILE_LAYER = 1
-    if not _WAN_FORCE_PROFILE_DIR:
+    if not _WAN_FORCE_PROFILE_DIR and enable_profile:
         _WAN_FORCE_PROFILE_DIR = "./log"
 
 
@@ -506,6 +514,7 @@ class WanTransformerBlock(nn.Module):
         added_kv_proj_dim: int | None = None,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
+        layer_idx: int = -1,
         attention_type: str = "original",
         sla_topk: float = 0.1,
     ):
@@ -555,7 +564,7 @@ class WanTransformerBlock(nn.Module):
                     dim // num_heads,
                     get_compute_dtype(),
                     supported_attention_backends=self_attn_backends,
-                )
+                ).get_enum()
                 == AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN
             ):
                 self.attn1 = LoadBalancingUlyssesAttention(
@@ -564,6 +573,7 @@ class WanTransformerBlock(nn.Module):
                     causal=False,
                     supported_attention_backends=self_attn_backends,
                     prefix=f"{prefix}.attn1",
+                    layer_idx=layer_idx
                 )
             else:
                 self.attn1 = USPAttention(
@@ -703,7 +713,16 @@ class WanTransformerBlock(nn.Module):
             query, key = _apply_rotary_emb(
                 query, cos, sin, is_neox_style=False
             ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
-        attn_output = self.attn1(query, key, value)
+        
+        attn_output, attn_time = _cuda_timed(lambda: self.attn1(query, key, value))
+
+        log_dir = os.getenv("PROFILE_LOG_DIR")
+        attn_log_path = os.path.join(log_dir, "attn_time_per_device.log")
+        with open(attn_log_path, 'a') as f:
+            ctx_attn_metadata = get_forward_context().attn_metadata
+            current_timestep = ctx_attn_metadata.current_timestep
+            f.write(f"Timestep{current_timestep}-Layer{self.attn1.layer_idx}: {attn_time}ms\n")
+        
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
@@ -974,6 +993,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                     self._supported_attention_backends
                     | {AttentionBackendEnum.VIDEO_SPARSE_ATTN},
                     prefix=f"{config.prefix}.blocks.{i}",
+                    layer_idx=i,
                     attention_type=config.attention_type,
                     sla_topk=config.sla_topk,
                 )
@@ -1120,6 +1140,9 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             timestep_proj=timestep_proj, temb=temb
         )
 
+        log_dir = os.getenv("PROFILE_LOG_DIR")
+        layer_log_path = os.path.join(log_dir, "dit_block_time_per_device.log")
+
         if should_skip_forward:
             hidden_states = self.retrieve_cached_states(hidden_states)
         else:
@@ -1139,9 +1162,15 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                     enabled,
                     f"wan2.block.r{profile_rank}.s{profile_step}.l{block_idx}",
                 ):
-                    hidden_states = block(
-                        hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
+                    hidden_states, layer_time = _cuda_timed(
+                        lambda: block(
+                            hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
+                        )
                     )
+                    with open(layer_log_path, 'a') as f:
+                        current_timestep = get_forward_context().current_timestep
+                        f.write(f"Timestep{current_timestep}-Layer{block_idx}: {layer_time}ms\n")
+
                 if (
                     force_profile
                     and _WAN_FORCE_PROFILE_LAYER is not None

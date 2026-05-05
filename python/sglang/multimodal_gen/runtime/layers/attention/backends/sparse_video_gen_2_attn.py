@@ -357,6 +357,7 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
         softmax_scale: float,
         num_kv_heads: int | None = None,
         prefix: str = "",
+        layer_idx: int = -1,
         **extra_impl_args,
     ) -> None:
         if causal:
@@ -369,7 +370,7 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
             )
         self.prefix = prefix
         self.num_heads = num_heads
-        self.layer_idx = self._get_layer_idx(prefix)
+        self.layer_idx = layer_idx
 
     def _get_layer_idx(self, prefix: str) -> int:
         parts = prefix.split(".")
@@ -552,11 +553,11 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
                 break
 
         if get_sequence_parallel_rank() == 0:
-            print(f"densities: {list(density_cpu)}")
-            print(f"sums: {list(sums)}")
+            # print(f"densities: {list(density_cpu)}")
+            # print(f"sums: {list(sums)}")
             T = max(sums)
             avg = sum(sums) / world_size
-            print("makespan", T, "avg", avg, "imb", T / avg)
+            # print("makespan", T, "avg", avg, "imb", T / avg)
 
         # keep stable head order within each rank (optional)
         for r in range(world_size):
@@ -564,6 +565,29 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
 
         flat = [h for r in range(world_size) for h in bins[r]]
         return flat, [len(bins[r]) for r in range(world_size)]
+
+    def _set_contiguous_head_assignment(
+        self,
+        attn_metadata: SparseVideoGen2AttentionMetadata,
+        world_size: int,
+        device: torch.device,
+    ) -> Svg2LayerCache:
+        layer_cache = attn_metadata.cache.get_layer(self.layer_idx)
+        num_heads = self.num_heads
+        cur_rank = get_sequence_parallel_rank()
+        heads_per_rank = _even_heads_per_rank(num_heads, world_size)
+        ofs = sum(heads_per_rank[:cur_rank])
+        head_perm = torch.arange(num_heads, device=device, dtype=torch.long)
+        layer_cache.head_perm = head_perm
+        layer_cache.head_perm_inv = head_perm
+        layer_cache.heads_per_rank = heads_per_rank
+        layer_cache.h_idxs_r_dev = torch.arange(
+            ofs,
+            ofs + heads_per_rank[cur_rank],
+            device=device,
+            dtype=torch.int32,
+        )
+        return layer_cache
 
     def _get_head_reorder_perm(
         self, attn_metadata: SparseVideoGen2AttentionMetadata, world_size: int
@@ -573,18 +597,12 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
         cur_rank = get_sequence_parallel_rank()
 
         if layer_cache.density_async_complete is None:
-            head_perm = torch.arange(
-                num_heads, device=torch.device("cuda"), dtype=torch.long
+            layer_cache = self._set_contiguous_head_assignment(
+                attn_metadata,
+                world_size,
+                torch.device("cuda"),
             )
-            heads_per_rank = _even_heads_per_rank(num_heads, world_size)
-            ofs = sum(heads_per_rank[:cur_rank])
-            layer_cache.head_perm = head_perm
-            layer_cache.head_perm_inv = head_perm
-            layer_cache.heads_per_rank = heads_per_rank
-            layer_cache.h_idxs_r_dev = head_perm[
-                ofs : ofs + heads_per_rank[cur_rank]
-            ].to(dtype=torch.int32)
-            return head_perm
+            return layer_cache.head_perm
 
         torch.cuda.current_stream().wait_event(layer_cache.density_async_complete)
         assert layer_cache.density is not None
@@ -645,6 +663,11 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
         attn_metadata: SparseVideoGen2AttentionMetadata,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if not self._use_sparse_attention(attn_metadata):
+            self._set_contiguous_head_assignment(
+                attn_metadata,
+                get_sequence_parallel_world_size(),
+                q.device,
+            )
             return q, k, v
         world_size = get_sequence_parallel_world_size()
         head_perm = self._get_head_reorder_perm(attn_metadata, world_size)
@@ -1204,19 +1227,17 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
         # contiguous when sparse window not active OR when no density yet.
         if self._use_sparse_attention(attn_metadata):
             self._get_head_reorder_perm(attn_metadata, world_size)
+        else:
+            self._set_contiguous_head_assignment(attn_metadata, world_size, q.device)
         layer_cache = attn_metadata.cache.get_layer(self.layer_idx)
-        if layer_cache.h_idxs_r_dev is None:
-            num_heads = self.num_heads
-            heads_per_rank = _even_heads_per_rank(num_heads, world_size)
-            cur_rank = get_sequence_parallel_rank()
-            ofs = sum(heads_per_rank[:cur_rank])
-            layer_cache.h_idxs_r_dev = torch.arange(
-                ofs,
-                ofs + heads_per_rank[cur_rank],
-                device=q.device,
-                dtype=torch.int32,
+        if (
+            layer_cache.h_idxs_r_dev is None
+            or layer_cache.heads_per_rank is None
+            or layer_cache.head_perm is None
+        ):
+            layer_cache = self._set_contiguous_head_assignment(
+                attn_metadata, world_size, q.device
             )
-            layer_cache.heads_per_rank = heads_per_rank
 
         h_idxs_r = layer_cache.h_idxs_r_dev
         heads_per_rank = layer_cache.heads_per_rank
@@ -1309,7 +1330,10 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
             # Build pos_of_head[gh] = r * max_hpr + lh and scatter to global
             # head order. heads_per_rank + h_idxs_r from each rank reconstruct
             # the bins: rank r's bin starts at flat_perm[sum(hpr[:r])].
-            head_perm_cpu = layer_cache.head_perm.tolist()
+            if layer_cache.head_perm is not None:
+                head_perm_cpu = layer_cache.head_perm.tolist()
+            else:
+                head_perm_cpu = list(range(h_total))
             pos_of_head_list = [0] * h_total
             ofs2 = 0
             for r in range(world_size):

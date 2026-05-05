@@ -1083,6 +1083,10 @@ class DenoisingStage(PipelineStage):
                 "average time per step: %.4f seconds",
                 (denoising_end_time - denoising_start_time) / len(timesteps),
             )
+            log_dir = os.getenv("PROFILE_LOG_DIR")
+            denoise_log_path = os.path.join(log_dir, "e2e_denoise.log")
+            with open(denoise_log_path, 'w') as f:
+                f.write(f"average time per step: {(denoising_end_time - denoising_start_time) / len(timesteps):.4f} seconds")
 
         self._post_denoising_loop(
             batch=batch,

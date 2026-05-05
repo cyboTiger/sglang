@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from typing import Any
+import os
 
 import numpy as np
 import torch
@@ -11,6 +12,13 @@ import torch.nn as nn
 from sglang.multimodal_gen.configs.models.dits import HunyuanVideoConfig
 from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_world_size
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_sequence_parallel_rank,
+    get_sequence_parallel_world_size,
+    get_sp_group,
+    get_sp_parallel_rank,
+)
+from sglang.multimodal_gen.runtime.layers.attention.backends.svg2_cost_profiler import _cuda_timed
 from sglang.multimodal_gen.runtime.layers.attention import (
     LoadBalancingUlyssesAttention,
     LocalAttention,
@@ -57,6 +65,7 @@ class MMDoubleStreamBlock(nn.Module):
         mlp_ratio: float,
         dtype: torch.dtype | None = None,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        layer_idx: int = -1,
         prefix: str = "",
     ):
         super().__init__()
@@ -65,6 +74,7 @@ class MMDoubleStreamBlock(nn.Module):
         self.num_attention_heads = num_attention_heads
         head_dim = hidden_size // num_attention_heads
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        self.layer_idx = layer_idx
 
         # Image modulation components
         self.img_mod = ModulateProjection(
@@ -162,6 +172,7 @@ class MMDoubleStreamBlock(nn.Module):
             causal=False,
             supported_attention_backends=supported_attention_backends,
             prefix=f"{prefix}.attn",
+            layer_idx=layer_idx,
         )
 
     def forward(
@@ -231,7 +242,14 @@ class MMDoubleStreamBlock(nn.Module):
         txt_k = self.txt_attn_k_norm(txt_k.contiguous()).to(txt_k.dtype)
 
         # Run distributed attention
-        img_attn, txt_attn = self.attn(img_q, img_k, img_v, txt_q, txt_k, txt_v)
+        (img_attn, txt_attn), attn_time = _cuda_timed(lambda: self.attn(img_q, img_k, img_v, txt_q, txt_k, txt_v))
+        log_dir = os.getenv("PROFILE_LOG_DIR")
+        attn_log_path = os.path.join(log_dir, "attn_time_per_device.log")
+        with open(attn_log_path, 'a') as f:
+            ctx_attn_metadata = get_forward_context().attn_metadata
+            current_timestep = ctx_attn_metadata.current_timestep
+            f.write(f"DoubleStream-Timestep{current_timestep}-Layer{self.attn.layer_idx}: {attn_time}ms\n")
+        
         img_attn_out, _ = self.img_attn_proj(
             img_attn.view(batch_size, image_seq_len, -1)
         )
@@ -274,6 +292,7 @@ class MMSingleStreamBlock(nn.Module):
         mlp_ratio: float = 4.0,
         dtype: torch.dtype | None = None,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        layer_idx: int = -1,
         prefix: str = "",
     ):
         super().__init__()
@@ -284,6 +303,7 @@ class MMSingleStreamBlock(nn.Module):
         head_dim = hidden_size // num_attention_heads
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         self.mlp_hidden_dim = mlp_hidden_dim
+        self.layer_idx = layer_idx
 
         # Combined QKV and MLP input projection
         self.linear1 = ReplicatedLinear(
@@ -346,6 +366,7 @@ class MMSingleStreamBlock(nn.Module):
             causal=False,
             supported_attention_backends=supported_attention_backends,
             prefix=f"{prefix}.attn",
+            layer_idx=layer_idx
         )
 
     def forward(
@@ -389,9 +410,17 @@ class MMSingleStreamBlock(nn.Module):
         ), _apply_rotary_emb(img_k, cos, sin, is_neox_style=False)
 
         # Run distributed attention
-        img_attn_output, txt_attn_output = self.attn(
-            img_q, img_k, img_v, txt_q, txt_k, txt_v
-        )
+        (img_attn_output, txt_attn_output), attn_time = _cuda_timed(lambda: self.attn(img_q, img_k, img_v, txt_q, txt_k, txt_v))
+        log_dir = os.getenv("PROFILE_LOG_DIR")
+        attn_log_path = os.path.join(log_dir, "attn_time_per_device.log")
+        with open(attn_log_path, 'a') as f:
+            ctx_attn_metadata = get_forward_context().attn_metadata
+            current_timestep = ctx_attn_metadata.current_timestep
+            f.write(f"SingleStream-Timestep{current_timestep}-Layer{self.attn.layer_idx}: {attn_time}ms\n")
+        
+        # img_attn_output, txt_attn_output = self.attn(
+        #     img_q, img_k, img_v, txt_q, txt_k, txt_v
+        # )
         attn_output = torch.cat((img_attn_output, txt_attn_output), dim=1).view(
             batch_size, seq_len, -1
         )
@@ -575,6 +604,9 @@ class HunyuanVideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         forward_batch = forward_context.forward_batch
         enable_teacache = forward_batch is not None and forward_batch.enable_teacache
 
+        log_dir = os.getenv("PROFILE_LOG_DIR")
+        layer_log_path = os.path.join(log_dir, "dit_block_time_per_device.log")
+
         if guidance is None:
             guidance = torch.tensor(
                 [6016.0], device=hidden_states.device, dtype=hidden_states.dtype
@@ -640,6 +672,12 @@ class HunyuanVideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             for index, block in enumerate(self.double_blocks):
                 double_block_args = [img, txt, vec, freqs_cis]
                 img, txt = block(*double_block_args)
+                (img, txt), layer_time = _cuda_timed(
+                        lambda: block(*double_block_args)
+                    )
+                with open(layer_log_path, 'a') as f:
+                    current_timestep = get_forward_context().current_timestep
+                    f.write(f"DoubleStream-Timestep{current_timestep}-Layer{index}: {layer_time}ms\n")
             # Merge txt and img to pass through single stream blocks
             x = torch.cat((img, txt), 1)
 
@@ -653,6 +691,12 @@ class HunyuanVideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                         freqs_cis,
                     ]
                     x = block(*single_block_args)
+                    x, layer_time = _cuda_timed(
+                        lambda: block(*single_block_args)
+                    )
+                    with open(layer_log_path, 'a') as f:
+                        current_timestep = get_forward_context().current_timestep
+                        f.write(f"SingleStream-Timestep{current_timestep}-Layer{index}: {layer_time}ms\n")
 
             # Extract image features
             img = x[:, :img_seq_len, ...]

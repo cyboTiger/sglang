@@ -2,6 +2,9 @@
 
 # SPDX-License-Identifier: Apache-2.0
 from typing import Type
+import os
+from sglang.multimodal_gen.runtime.layers.attention.backends.svg2_cost_profiler import _cuda_timed
+
 
 import torch
 import torch.nn as nn
@@ -406,6 +409,7 @@ class LoadBalancingUlyssesAttention(USPAttention):
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
         dropout_rate: float = 0.0,
+        layer_idx: int = -1,
         **extra_impl_args,
     ) -> None:
         super().__init__(
@@ -419,6 +423,7 @@ class LoadBalancingUlyssesAttention(USPAttention):
             dropout_rate=dropout_rate,
             **extra_impl_args,
         )
+        self.layer_idx = layer_idx
         if self.backend != AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN:
             raise ValueError(
                 "LoadBalancingUlyssesAttention requires SPARSE_VIDEO_GEN_2_ATTN backend."
@@ -452,6 +457,8 @@ class LoadBalancingUlyssesAttention(USPAttention):
 
         forward_context: ForwardContext = get_forward_context()
         ctx_attn_metadata = forward_context.attn_metadata
+        log_dir = os.getenv("PROFILE_LOG_DIR")
+        attn_log_path = os.path.join(log_dir, "attn_time_per_device.log")
 
         if get_ring_parallel_world_size() > 1:
             raise RuntimeError(
@@ -542,6 +549,9 @@ class LoadBalancingUlyssesAttention(USPAttention):
             k = torch.cat([k, replicated_k_local], dim=1)
             v = torch.cat([v, replicated_v_local], dim=1)
 
+        out, attn_time = _cuda_timed(
+                    lambda: self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+                )
         out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
 
         replicated_out = None
