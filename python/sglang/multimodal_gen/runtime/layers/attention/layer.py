@@ -549,9 +549,6 @@ class LoadBalancingUlyssesAttention(USPAttention):
             k = torch.cat([k, replicated_k_local], dim=1)
             v = torch.cat([v, replicated_v_local], dim=1)
 
-        out, attn_time = _cuda_timed(
-                    lambda: self.attn_impl.forward(q, k, v, ctx_attn_metadata)
-                )
         out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
 
         replicated_out = None
